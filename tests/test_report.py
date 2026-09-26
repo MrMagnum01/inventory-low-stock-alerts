@@ -43,6 +43,39 @@ def test_missing_inventory_file(tmp_path):
     assert result.file_present is False
 
 
+def test_cli_fails_loudly_on_header_only_inventory_file(tmp_path):
+    # Astra follow-up finding 1 regression, exact probe fixture: a
+    # header-only inventory CSV used to give exit 0, "OK", no alert. It
+    # must now fail non-zero, fire a critical alert, and the report itself
+    # must say "no data" rather than silently looking like a clean check.
+    src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    inv_csv = tmp_path / "inv.csv"
+    inv_csv.write_text("sku,product_name,warehouse,on_hand,lead_time_days\n")
+    sales_csv = tmp_path / "sales.csv"
+    sales_csv.write_text("date,sku,warehouse,units_sold\n2026-01-15,s,w,1\n")
+
+    env = dict(os.environ, NOTIFY_CMD="true", INV_STATE_DIR=str(tmp_path / "state"))
+    proc = subprocess.run(
+        [sys.executable, os.path.join(src_dir, "generate_report.py"),
+         "--inventory", str(inv_csv), "--sales", str(sales_csv),
+         "--output-dir", str(tmp_path / "output"), "--as-of", AS_OF],
+        cwd=src_dir, env=env, capture_output=True, text=True,
+    )
+    assert proc.returncode != 0
+    assert "OK: report" not in proc.stdout
+    html = (tmp_path / "output" / f"low-stock-report-{AS_OF}.html").read_text()
+    assert "no data" in html.lower()
+
+
+def test_empty_inventory_load_result_has_no_rows(tmp_path):
+    inv_csv = tmp_path / "inv.csv"
+    inv_csv.write_text("sku,product_name,warehouse,on_hand,lead_time_days\n")
+    result = load_inventory(str(inv_csv))
+    assert result.file_present is True
+    assert result.file_empty is True
+    assert result.rows == []
+
+
 def test_valid_inventory_row_parses(tmp_path):
     row = "SKU-1,Lamp,Home,wh-east,50,7\n"
     path = _write(tmp_path, "inv.csv", INV_HEADER, row)

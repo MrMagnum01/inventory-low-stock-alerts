@@ -107,6 +107,16 @@ def render_html(as_of, results, inv_result, sales_result, outlier_count, trend_c
     if trend_chart_rel_path:
         chart_html = f"<h2>Weekly sales trend</h2><img src='{_esc(trend_chart_rel_path)}' alt='Weekly units sold trend' style='max-width:100%;border:1px solid #ddd;border-radius:8px;'>"
 
+    no_data_html = ""
+    if not inv_result.file_present:
+        no_data_html = "<div class='flag error'><strong>Inventory input file was not found. This report has no data.</strong></div>"
+    elif not inv_result.rows:
+        no_data_html = (
+            "<div class='flag error'><strong>No data: this inventory input had zero usable rows "
+            "for this date (empty or all-invalid).</strong> This report is empty by design -- "
+            "the run was treated as a failure, not a successful zero-item check.</div>"
+        )
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -126,6 +136,7 @@ def render_html(as_of, results, inv_result, sales_result, outlier_count, trend_c
   th {{ background: #f0f0f0; }}
   .flag {{ background: #fff8e1; border: 1px solid #f0d878; border-radius: 6px; padding: 0.8rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; }}
   .flag.warn {{ background: #fff3e0; border-color: #f0b878; }}
+  .flag.error {{ background: #fdecea; border-color: #e57373; }}
   h2 {{ margin-top: 2rem; }}
   .note {{ color: #666; font-size: 0.85rem; }}
 </style>
@@ -133,6 +144,8 @@ def render_html(as_of, results, inv_result, sales_result, outlier_count, trend_c
 <body>
 <h1>Low-Stock Alert Report</h1>
 <div class="meta">As of: {_esc(as_of)} &middot; generated {_esc(generated_at)}</div>
+
+{no_data_html}
 
 <div class="kpis">
   <div class="kpi low"><div class="label">Low stock</div><div class="value">{len(low)}</div></div>

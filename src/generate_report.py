@@ -54,6 +54,22 @@ def main(argv=None) -> int:
         print(f"ERROR: sales file not found: {args.sales}", file=sys.stderr)
         return 2
 
+    # A present-but-empty (header-only) or all-invalid inventory file is
+    # NOT a successful "zero items" check -- there is nothing to report on,
+    # and the old behaviour of silently exiting 0/OK here (Astra follow-up
+    # finding 1) let a broken export masquerade as a clean run. Fire a
+    # critical alert and fail loudly; still render the report (with a "no
+    # data" banner, via render_html's inv_result.rows check below) so the
+    # artifact itself documents the failure rather than simply not existing.
+    no_inventory_data = inv_result.file_empty or not inv_result.rows
+    no_inventory_data_delivered = True
+    if no_inventory_data:
+        no_inventory_data_delivered = fire(
+            as_of, "no_inventory_data", "critical",
+            f"No usable inventory rows for {as_of} in {args.inventory} "
+            f"(empty or all rows invalid) -- refusing to treat this as a clean run.",
+        )
+
     # Outlier/anomaly analysis is scoped to rows dated at or before as_of --
     # an "as of <date>" report must not be influenced by rows dated after
     # that date (Astra finding 4; weekly_trend applies the same rule
@@ -103,6 +119,9 @@ def main(argv=None) -> int:
                      f"{len(low)} SKU/warehouse combination(s) below reorder point on {as_of}: {skus}{more}"):
             delivery_failures.append("low_stock")
 
+    if not no_inventory_data_delivered:
+        delivery_failures.append("no_inventory_data")
+
     if delivery_failures:
         print(
             f"PARTIAL: report generated for {as_of} -> {html_path}, "
@@ -110,6 +129,14 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return 3
+
+    if no_inventory_data:
+        print(
+            f"ERROR: no usable inventory rows for {as_of} in {args.inventory} "
+            f"-- report written to {html_path} with a no-data banner, but this run is NOT OK",
+            file=sys.stderr,
+        )
+        return 4
 
     print(f"OK: report for {as_of} -> {html_path}")
     return 0

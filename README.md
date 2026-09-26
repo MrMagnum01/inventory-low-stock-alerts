@@ -34,7 +34,11 @@ and wants, every morning, without anyone touching it:
    `date`+`sku`+`warehouse` in sales). Malformed rows are skipped and
    categorized (counts only); duplicates are quarantined — kept out of the
    calculation, and the full raw row is retained so the exceptions report
-   shows exactly what was excluded.
+   shows exactly what was excluded. A present-but-empty (header-only) or
+   all-invalid inventory file is treated as a **failed run**, not a clean
+   "zero items" check: the CLI fires a critical alert, exits non-zero, and
+   the HTML report itself carries a visible "no data" banner rather than
+   silently looking like a successful check with nothing to report.
 2. **Compute reorder points** (`src/reorder.py`):
    `reorder_point = avg_daily_sales * lead_time_days + safety_stock`, with
    `safety_stock = Z * stdev(daily_sales) * sqrt(lead_time_days)` — see
@@ -144,14 +148,16 @@ Run the tests:
 .venv/bin/python -m pytest tests -v
 ```
 
-27 tests: schema/type validation for both input files (including
+29 tests: schema/type validation for both input files (including
 non-finite/non-integer values that must be rejected as exceptions, not
 crash or silently truncate), duplicate-key quarantine for both,
 reorder-point math (LOW / OK / NO_HISTORY, including the exact
 partial-coverage regression that used to be misreported as OK),
 full-window-coverage requirement, future-dated-row exclusion from the
-weekly trend chart, demand-outlier detection, CSV summary/exceptions
-writing, alert firing and idempotency, an end-to-end CLI run, and four
+weekly trend chart, demand-outlier detection, a header-only-inventory
+regression proving an empty source now fails loudly with a "no data"
+report instead of a silent OK, CSV summary/exceptions writing, alert
+firing and idempotency, an end-to-end CLI run, and four
 subprocess tests of the real CLI/`run_daily.sh` (lock contention,
 retry-then-escalate, notifier-failure exit code, and the wrapper retrying
 after a notifier failure).
@@ -179,6 +185,7 @@ when something needs attention.
 |---|---|---|
 | No new files in `output/` after the scheduled time | Input CSV(s) not present yet, or timer/cron not firing | Check `src/alerts.log`; check `systemctl list-timers` or `crontab -l` |
 | `alerts.log` has `inventory_input_missing` / `sales_input_missing` | Upstream export job didn't land the file | Confirm the export job on the source system; rerun once present |
+| `alerts.log` has `no_inventory_data`, CLI exited 4 | Inventory file exists but is empty (header-only) or every row failed validation | Confirm the export job actually wrote rows, not just a header; check `exceptions-<date>.csv` if some rows exist but were all invalid |
 | `alerts.log` has `malformed_rows` | Some rows failed validation | Open `exceptions-<date>.csv`, check the `category` column, fix upstream data entry |
 | `alerts.log` has `low_stock` | Expected — this is the report doing its job | Review `low-stock-report-<date>.html`, action the reorder |
 | CLI printed `PARTIAL` and exited non-zero | Report was generated, but one or more alerts failed to deliver (`NOTIFY_CMD` failed) | Check stderr/`alerts.log` for which event id(s) failed; `run_daily.sh` will retry it |
@@ -188,12 +195,20 @@ when something needs attention.
 | Two scheduled runs overlapped | `run_daily.sh` took the `flock`; the second logs a `WARNING` and exits 0 without touching `output/`. This only protects runs made *through* `run_daily.sh` — a manual direct `generate_report.py` invocation is not locked. |
 | `run_daily.sh` retried and still failed | Check `alerts.log` for the final `CRITICAL` line and exit code; rerun `generate_report.py` directly for the full traceback |
 
-**Support boundary.** This repo is a bounded, reviewed automation: input
-format, the reorder-point formula, and report layout as documented here.
-Changes to any of those (new columns, a different service level, a
-seasonal-demand model, a different alert channel) are scoped change
-requests, not "support." No uptime/response-time SLA is implied by this
-demo.
+**Support boundary.** This repo is a bounded automation demo under review,
+not a cleared operational delivery. What "reviewed" means concretely here:
+an independent reviewer read the source, ran the test suite against fixed
+regression fixtures, and verified specific claims (history-coverage
+requirement, future-date exclusion, exit codes) by direct probe. What it
+does **not** mean: no real scheduled run against a live timer/cron with a
+controlled receiver has completed a documented fail-then-recover-then-
+restart cycle yet (see `docs/recovery-evidence.md` for what has), no
+production notification channel has been exercised, and no client
+engagement or SLA has been defined. Scope as delivered: input format, the
+reorder-point formula, and report layout as documented here. Changes to
+any of those (new columns, a different service level, a seasonal-demand
+model, a different alert channel) are scoped change requests, not
+"support." No uptime/response-time SLA is implied by this demo.
 
 ## Limits
 
