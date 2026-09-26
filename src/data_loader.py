@@ -19,14 +19,42 @@ from config import INVENTORY_REQUIRED_COLUMNS, SALES_REQUIRED_COLUMNS
 
 CAT_MISSING_FIELD = "missing_field"
 CAT_NON_NUMERIC_ON_HAND = "non_numeric_on_hand"
+CAT_NON_FINITE_ON_HAND = "non_finite_on_hand"  # inf / -inf / NaN
+CAT_NON_INTEGER_ON_HAND = "non_integer_on_hand"  # e.g. 12.5 units on hand
 CAT_NON_NUMERIC_LEAD_TIME = "non_numeric_lead_time"
+CAT_NON_FINITE_LEAD_TIME = "non_finite_lead_time"
+CAT_NON_INTEGER_LEAD_TIME = "non_integer_lead_time"
 CAT_INVALID_LEAD_TIME = "invalid_lead_time"  # <= 0
 CAT_DUPLICATE_SKU_WAREHOUSE = "duplicate_sku_warehouse"
 
 CAT_BAD_DATE = "bad_date"
 CAT_NON_NUMERIC_UNITS = "non_numeric_units_sold"
+CAT_NON_FINITE_UNITS = "non_finite_units_sold"
+CAT_NON_INTEGER_UNITS = "non_integer_units_sold"
 CAT_NEGATIVE_UNITS = "negative_units_sold"
 CAT_DUPLICATE_SALES_ROW = "duplicate_sales_row"
+
+
+def _parse_finite_integer(raw_value):
+    """Parse a CSV cell as a finite, whole-number float -> int.
+
+    Returns (value, error_suffix). error_suffix is one of "non_numeric"
+    (can't even parse as a float), "non_finite" (inf/-inf/NaN -- Python's
+    plain `int(float(x))` either raises OverflowError on inf or silently
+    truncates a NaN/fraction, both of which are validation defects, not
+    crashes or silent data loss), or "non_integer" (a real but fractional
+    value, e.g. "12.5" units on hand -- truncating it silently would be a
+    silent data change). value is None whenever error_suffix is set.
+    """
+    try:
+        f = float(raw_value)
+    except (ValueError, TypeError):
+        return None, "non_numeric"
+    if not math.isfinite(f):
+        return None, "non_finite"
+    if f != int(f):
+        return None, "non_integer"
+    return int(f), None
 
 
 @dataclass
@@ -89,18 +117,25 @@ def load_inventory(csv_path: str) -> LoadResult:
                 result._bump(CAT_MISSING_FIELD)
                 continue
 
-            try:
-                on_hand = int(float(raw["on_hand"]))
-                if on_hand < 0:
-                    raise ValueError("negative on_hand")
-            except (ValueError, TypeError):
+            on_hand, err = _parse_finite_integer(raw["on_hand"])
+            if err is not None:
+                result._bump({
+                    "non_numeric": CAT_NON_NUMERIC_ON_HAND,
+                    "non_finite": CAT_NON_FINITE_ON_HAND,
+                    "non_integer": CAT_NON_INTEGER_ON_HAND,
+                }[err])
+                continue
+            if on_hand < 0:
                 result._bump(CAT_NON_NUMERIC_ON_HAND)
                 continue
 
-            try:
-                lead_time = int(float(raw["lead_time_days"]))
-            except (ValueError, TypeError):
-                result._bump(CAT_NON_NUMERIC_LEAD_TIME)
+            lead_time, err = _parse_finite_integer(raw["lead_time_days"])
+            if err is not None:
+                result._bump({
+                    "non_numeric": CAT_NON_NUMERIC_LEAD_TIME,
+                    "non_finite": CAT_NON_FINITE_LEAD_TIME,
+                    "non_integer": CAT_NON_INTEGER_LEAD_TIME,
+                }[err])
                 continue
 
             if lead_time <= 0:
@@ -164,10 +199,13 @@ def load_sales(csv_path: str) -> LoadResult:
                 result._bump(CAT_BAD_DATE)
                 continue
 
-            try:
-                units_sold = int(float(raw["units_sold"]))
-            except (ValueError, TypeError):
-                result._bump(CAT_NON_NUMERIC_UNITS)
+            units_sold, err = _parse_finite_integer(raw["units_sold"])
+            if err is not None:
+                result._bump({
+                    "non_numeric": CAT_NON_NUMERIC_UNITS,
+                    "non_finite": CAT_NON_FINITE_UNITS,
+                    "non_integer": CAT_NON_INTEGER_UNITS,
+                }[err])
                 continue
 
             if units_sold < 0:

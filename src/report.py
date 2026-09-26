@@ -23,12 +23,14 @@ def write_csv_summary(path, as_of, results):
         w.writerow([
             "sku", "product_name", "warehouse", "status", "on_hand",
             "avg_daily_sales", "stdev_daily_sales", "reorder_point", "days_of_cover",
+            "observed_days", "required_days",
         ])
         for r in sorted(results, key=lambda x: (x.status != "LOW", x.sku, x.warehouse)):
             w.writerow([
                 r.sku, r.product_name, r.warehouse, r.status, r.on_hand,
                 r.avg_daily_sales, r.stdev_daily_sales, r.reorder_point,
                 "inf" if r.days_of_cover == float("inf") else r.days_of_cover,
+                r.observed_days, r.required_days,
             ])
 
 
@@ -64,8 +66,15 @@ def render_html(as_of, results, inv_result, sales_result, outlier_count, trend_c
             f"<td>{_esc(cover)}</td></tr>"
         )
 
+    def no_hist_row_html(r):
+        return (
+            f"<tr><td>{_esc(r.sku)}</td><td>{_esc(r.product_name)}</td>"
+            f"<td>{_esc(r.warehouse)}</td><td>{r.on_hand}</td>"
+            f"<td>{_esc(r.observed_days)} / {_esc(r.required_days)} days</td></tr>"
+        )
+
     low_rows = "\n".join(row_html(r) for r in low) or "<tr><td colspan=7>No SKUs below reorder point</td></tr>"
-    no_hist_rows = "\n".join(row_html(r) for r in no_hist) or "<tr><td colspan=7>None</td></tr>"
+    no_hist_rows = "\n".join(no_hist_row_html(r) for r in no_hist) or "<tr><td colspan=5>None</td></tr>"
 
     bad_rows_html = ""
     total_bad = inv_result.total_bad_rows() + sales_result.total_bad_rows()
@@ -118,6 +127,7 @@ def render_html(as_of, results, inv_result, sales_result, outlier_count, trend_c
   .flag {{ background: #fff8e1; border: 1px solid #f0d878; border-radius: 6px; padding: 0.8rem 1rem; margin-bottom: 1rem; font-size: 0.9rem; }}
   .flag.warn {{ background: #fff3e0; border-color: #f0b878; }}
   h2 {{ margin-top: 2rem; }}
+  .note {{ color: #666; font-size: 0.85rem; }}
 </style>
 </head>
 <body>
@@ -142,8 +152,9 @@ def render_html(as_of, results, inv_result, sales_result, outlier_count, trend_c
 </table>
 
 <h2>Insufficient sales history</h2>
+<p class="note">Shown when the sales input does not cover the full lookback window for that SKU/warehouse -- no reorder point is computed or trusted.</p>
 <table>
-<tr><th>SKU</th><th>Product</th><th>Warehouse</th><th>On hand</th><th>Avg daily sales</th><th>Reorder point</th><th>Days of cover</th></tr>
+<tr><th>SKU</th><th>Product</th><th>Warehouse</th><th>On hand</th><th>Days of coverage observed</th></tr>
 {no_hist_rows}
 </table>
 

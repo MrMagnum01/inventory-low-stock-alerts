@@ -20,46 +20,72 @@ and wants, every morning, without anyone touching it:
 - a weekly trend chart so a human can sanity-check demand at a glance
 - confidence that malformed or duplicate rows in either file didn't
   silently corrupt the calculation
-- a scheduled run that survives a slow/missing export (retry) and never
-  double-alerts on a rerun (idempotent)
+- a scheduled run that survives a slow/missing export (retry), and where a
+  failed alert delivery makes the run itself fail so it gets retried
+  instead of being silently swallowed
 
 ## What it does
 
 1. **Validate** (`src/data_loader.py`): schema check on both files, type
-   checks (`on_hand`, `lead_time_days`, `units_sold`), duplicate detection
-   (`sku`+`warehouse` in inventory; `date`+`sku`+`warehouse` in sales).
-   Malformed rows are skipped and categorized; duplicates are quarantined
-   — kept out of the calculation, recorded, never silently dropped.
+   checks (`on_hand`, `lead_time_days`, `units_sold`) that reject
+   non-numeric, non-finite (inf/NaN), and non-integer values as
+   categorized bad rows rather than crashing or silently truncating, and
+   duplicate detection (`sku`+`warehouse` in inventory;
+   `date`+`sku`+`warehouse` in sales). Malformed rows are skipped and
+   categorized (counts only); duplicates are quarantined — kept out of the
+   calculation, and the full raw row is retained so the exceptions report
+   shows exactly what was excluded.
 2. **Compute reorder points** (`src/reorder.py`):
    `reorder_point = avg_daily_sales * lead_time_days + safety_stock`, with
    `safety_stock = Z * stdev(daily_sales) * sqrt(lead_time_days)` — see
-   "How the numbers are computed" below. A SKU/warehouse with fewer than 2
-   days of sales history in the lookback window is reported as
-   `NO_HISTORY` rather than given a false-confidence number.
+   "How the numbers are computed" below. A SKU/warehouse is only given a
+   trusted `LOW`/`OK` status when the sales input contains a row for
+   **every day** of the lookback window (default 28) for that
+   SKU/warehouse. Partial coverage — even two positive-sales days out of
+   28 — is reported as `NO_HISTORY`, never `OK`: "no row for a day" is not
+   assumed to mean "zero sales that day," so a partial window is not
+   silently treated as a complete one. The report shows the exact
+   `observed_days / required_days` coverage for every `NO_HISTORY` SKU.
 3. **Flag demand outliers**: a sales day far outside a SKU's own
-   distribution is flagged for review (kept in the average, not dropped).
+   distribution *as of the report date* is flagged for review (kept in the
+   average, not dropped). Rows dated after `as_of` are excluded from this
+   analysis and from the weekly trend chart — an "as of `<date>`" report
+   never uses information from after that date.
 4. **Report** (`src/report.py`, `src/chart.py`): an HTML report (low-stock
-   table, no-history table, weekly units-sold trend chart) and a CSV
-   summary of every SKU/warehouse. All CSV-derived text is HTML-escaped
-   before rendering.
-5. **Exceptions report**: a CSV listing every skipped/quarantined row plus
-   outlier counts, for auditing upstream data quality.
+   table, no-history table with coverage evidence, weekly units-sold trend
+   chart) and a CSV summary of every SKU/warehouse. All CSV-derived text
+   is HTML-escaped before rendering.
+5. **Exceptions report**: a CSV with per-category counts for malformed
+   (skipped) rows, plus outlier counts, and one row per quarantined
+   duplicate with its full original data.
 6. **Schedule** (`deploy/`): a cron example and a systemd service+timer
    pair, both driving `src/run_daily.sh`.
-7. **Retry + idempotency** (`src/run_daily.sh`, `src/alert_state.py`):
-   retries a transient failure with backoff, takes an exclusive `flock` so
-   an overlapping run skips instead of racing, and alert delivery is
-   deduplicated per `(as_of, event_id)` so a rerun of the same date never
-   re-fires a notification that already went out.
+7. **Retry, locking, and delivery-failure propagation**
+   (`src/run_daily.sh`, `src/alert_state.py`): the wrapper retries a
+   transient failure (input not mounted yet, or a failed alert delivery)
+   with backoff, and takes an exclusive `flock` so an overlapping
+   *scheduled* run skips instead of racing — this lock only covers runs
+   made through `run_daily.sh`; a direct `generate_report.py` invocation
+   bypasses it. Alert delivery is deduplicated per `(as_of, event_id)`
+   **after a successful send only**, so a rerun does not re-notify on an
+   already-delivered condition, and a failed delivery is retried on the
+   next run. This is **at-least-once** delivery, not exactly-once: a crash
+   between sending and recording that state (or a corrupted state file,
+   treated as empty rather than blocking the run) can duplicate a
+   notification, and switching from the console stub to a real
+   `NOTIFY_CMD` with old dedup state present can suppress that day's real
+   alert until the state file is cleared.
 8. **Failure alerts** (`src/alert.py`): a stub that prints the exact
-   payload it would send. Point `NOTIFY_CMD` at any executable that reads
-   JSON on stdin to wire a real channel.
+   payload it would send; set `NOTIFY_CMD` to wire a real channel. The CLI
+   tracks every alert's delivery result: if any fails, `generate_report.py`
+   prints `PARTIAL` (not `OK`) and exits non-zero, so `run_daily.sh`'s
+   retry loop retries the whole run. There is no separate outbox/queue —
+   "retry" means rerunning the report generator, safe because delivery
+   state is marked only on success.
 
 ## How the numbers are computed
 
-For each SKU/warehouse, over the trailing `lookback_days` (default 28,
-zero-filled for days with no sales row — a real zero-sales day, not
-missing data):
+For each SKU/warehouse, over the trailing `lookback_days` (default 28):
 
 ```
 avg_daily_sales   = mean(daily units sold)
@@ -67,11 +93,26 @@ safety_stock      = Z * stdev(daily units sold) * sqrt(lead_time_days)
 reorder_point     = avg_daily_sales * lead_time_days + safety_stock
 ```
 
+**Coverage requirement.** The daily series is zero-filled only for days
+that have *some* observed sales row for that SKU/warehouse in the window
+-- a day with an actual row of `units_sold=0` is a real zero-sales day. A
+day with **no row at all** is never assumed to be zero; it's unknown data,
+not zero demand. `observed_days` counts distinct dated rows present in the
+window; the SKU/warehouse only gets a trusted `LOW`/`OK` status when
+`observed_days == lookback_days` (every day in the window has a row). Any
+gap — a brand-new SKU, a missing export day, a warehouse that just went
+live — reports `NO_HISTORY` with the exact `observed_days/required_days`
+shown, rather than computing an average from partial, unlabelled data.
+
 `Z = 1.65` by default (~95% single-sided service level — the standard
 choice for this formula; overridable via `INV_SERVICE_LEVEL_Z`). This is a
 textbook reorder-point model, not a machine-learned forecast — it assumes
 roughly stationary demand over the lookback window. A client with strong
 seasonality needs a different model; say so up front.
+
+All of the above is computed only from sales rows dated at or before
+`as_of` — a row dated after the report date is excluded from the reorder
+calculation, the outlier analysis, and the weekly trend chart.
 
 ## Sample output
 
@@ -103,12 +144,17 @@ Run the tests:
 .venv/bin/python -m pytest tests -v
 ```
 
-18 tests: schema/type validation for both input files, duplicate-key
-quarantine for both, reorder-point math (LOW / OK / NO_HISTORY cases),
-demand-outlier detection, weekly-trend zero-filling, CSV summary/exceptions
-writing, alert firing and idempotency, an end-to-end CLI run, and two
-subprocess tests of `run_daily.sh` itself (lock contention,
-retry-then-escalate).
+27 tests: schema/type validation for both input files (including
+non-finite/non-integer values that must be rejected as exceptions, not
+crash or silently truncate), duplicate-key quarantine for both,
+reorder-point math (LOW / OK / NO_HISTORY, including the exact
+partial-coverage regression that used to be misreported as OK),
+full-window-coverage requirement, future-dated-row exclusion from the
+weekly trend chart, demand-outlier detection, CSV summary/exceptions
+writing, alert firing and idempotency, an end-to-end CLI run, and four
+subprocess tests of the real CLI/`run_daily.sh` (lock contention,
+retry-then-escalate, notifier-failure exit code, and the wrapper retrying
+after a notifier failure).
 
 ## What a client gets
 
@@ -135,9 +181,11 @@ when something needs attention.
 | `alerts.log` has `inventory_input_missing` / `sales_input_missing` | Upstream export job didn't land the file | Confirm the export job on the source system; rerun once present |
 | `alerts.log` has `malformed_rows` | Some rows failed validation | Open `exceptions-<date>.csv`, check the `category` column, fix upstream data entry |
 | `alerts.log` has `low_stock` | Expected — this is the report doing its job | Review `low-stock-report-<date>.html`, action the reorder |
-| A SKU shows `NO_HISTORY` | Fewer than 2 days of sales in the lookback window (new SKU, or a gap in the sales export) | Not an error; the reorder-point number for it should not be trusted until real history accumulates |
-| Report looks right but a rerun didn't re-alert | By design — deduplicated per `(as_of, event_id)` in `state/alerts-<date>.json`. Delete that file to force re-delivery for testing. |
-| Two scheduled runs overlapped | `run_daily.sh` took the `flock`; the second logs a `WARNING` and exits 0 without touching `output/`. Expected. |
+| CLI printed `PARTIAL` and exited non-zero | Report was generated, but one or more alerts failed to deliver (`NOTIFY_CMD` failed) | Check stderr/`alerts.log` for which event id(s) failed; `run_daily.sh` will retry it |
+| A SKU shows `NO_HISTORY` | The sales input does not have a row for every day of the lookback window for that SKU/warehouse (new SKU, a gap in the export, or a warehouse that just went live) — check the report's `observed_days/required_days` column | Not an error; the reorder-point number for it is intentionally withheld until full-window history exists |
+| Report looks right but a rerun didn't re-alert | By design, for conditions **already successfully delivered** — dedup is per `(as_of, event_id)` in `state/alerts-<date>.json`, marked only on send success. A failed delivery is retried, not suppressed. Delete the state file to force re-delivery for testing. |
+| Switched from the console stub to a real `NOTIFY_CMD` and a known alert didn't arrive | Old dedup state from the stub run may still be present and will suppress the real send | Clear `state/alerts-<date>.json` for that date before relying on the real channel |
+| Two scheduled runs overlapped | `run_daily.sh` took the `flock`; the second logs a `WARNING` and exits 0 without touching `output/`. This only protects runs made *through* `run_daily.sh` — a manual direct `generate_report.py` invocation is not locked. |
 | `run_daily.sh` retried and still failed | Check `alerts.log` for the final `CRITICAL` line and exit code; rerun `generate_report.py` directly for the full traceback |
 
 **Support boundary.** This repo is a bounded, reviewed automation: input

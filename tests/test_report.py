@@ -14,6 +14,9 @@ from data_loader import (
     CAT_INVALID_LEAD_TIME,
     CAT_MISSING_FIELD,
     CAT_NEGATIVE_UNITS,
+    CAT_NON_FINITE_ON_HAND,
+    CAT_NON_FINITE_UNITS,
+    CAT_NON_INTEGER_ON_HAND,
     CAT_NON_NUMERIC_ON_HAND,
     load_inventory,
     load_sales,
@@ -79,6 +82,40 @@ def test_duplicate_sku_warehouse_is_quarantined(tmp_path):
     assert result.quarantined[0].category == CAT_DUPLICATE_SKU_WAREHOUSE
 
 
+def test_infinite_on_hand_is_validation_exception_not_crash(tmp_path):
+    # Astra finding 4 regression: int(float("inf")) raises an uncaught
+    # OverflowError in the old code. It must now be a categorized bad row.
+    row = "SKU-1,Lamp,Home,wh-east,inf,7\n"
+    path = _write(tmp_path, "inv.csv", INV_HEADER, row)
+    result = load_inventory(path)  # must not raise
+    assert result.rows == []
+    assert result.bad_row_categories[CAT_NON_FINITE_ON_HAND] == 1
+
+
+def test_nan_on_hand_is_validation_exception_not_crash(tmp_path):
+    row = "SKU-1,Lamp,Home,wh-east,nan,7\n"
+    path = _write(tmp_path, "inv.csv", INV_HEADER, row)
+    result = load_inventory(path)  # must not raise
+    assert result.rows == []
+    assert result.bad_row_categories[CAT_NON_FINITE_ON_HAND] == 1
+
+
+def test_fractional_on_hand_is_validation_exception_not_silently_truncated(tmp_path):
+    row = "SKU-1,Lamp,Home,wh-east,12.5,7\n"
+    path = _write(tmp_path, "inv.csv", INV_HEADER, row)
+    result = load_inventory(path)
+    assert result.rows == []
+    assert result.bad_row_categories[CAT_NON_INTEGER_ON_HAND] == 1
+
+
+def test_infinite_units_sold_is_validation_exception_not_crash(tmp_path):
+    row = "2026-01-15,SKU-1,wh-east,inf\n"
+    path = _write(tmp_path, "sales.csv", SALES_HEADER, row)
+    result = load_sales(path)  # must not raise
+    assert result.rows == []
+    assert result.bad_row_categories[CAT_NON_FINITE_UNITS] == 1
+
+
 def test_negative_units_sold_is_bad_row(tmp_path):
     row = "2026-01-15,SKU-1,wh-east,-3\n"
     path = _write(tmp_path, "sales.csv", SALES_HEADER, row)
@@ -135,6 +172,59 @@ def test_reorder_point_ok_when_on_hand_comfortable():
     ]
     results = compute_reorder_points(inv, sales, AS_OF)
     assert results[0].status == "OK"
+
+
+def test_two_days_of_sales_is_not_treated_as_full_history_regression():
+    # Exact Astra probe fixture (finding 3): only 2 days of sales rows
+    # exist against a 28-day default lookback. The old code treated
+    # "2 nonzero days" as sufficient (status OK, avg=0.71 from summing
+    # 2 real days over 28 assumed days). It must now be NO_HISTORY,
+    # never OK, because the window isn't actually covered.
+    from data_loader import InventoryRow, SalesRow
+
+    inv = [InventoryRow(sku="s", product_name="p", warehouse="w", on_hand=100, lead_time_days=3)]
+    sales = [
+        SalesRow(date="2026-01-14", sku="s", warehouse="w", units_sold=10),
+        SalesRow(date="2026-01-15", sku="s", warehouse="w", units_sold=10),
+    ]
+    r = compute_reorder_points(inv, sales, "2026-01-15")[0]
+    assert r.status == "NO_HISTORY"
+    assert r.status != "OK"
+    assert r.insufficient_history is True
+    assert r.observed_days == 2
+    assert r.required_days == 28
+    assert r.days_of_cover == float("inf")  # no trusted days-of-cover number either
+
+
+def test_full_window_coverage_is_required_for_a_trusted_status():
+    # Complement: a SKU with a sales row for every day of the lookback
+    # window (even a short custom one) DOES get a real LOW/OK status.
+    from data_loader import InventoryRow, SalesRow
+    from datetime import datetime, timedelta
+
+    inv = [InventoryRow(sku="s", product_name="p", warehouse="w", on_hand=100, lead_time_days=3)]
+    sales = [
+        SalesRow(
+            date=(datetime.strptime("2026-01-15", "%Y-%m-%d") - timedelta(days=i)).strftime("%Y-%m-%d"),
+            sku="s", warehouse="w", units_sold=1,
+        )
+        for i in range(5)
+    ]
+    r = compute_reorder_points(inv, sales, "2026-01-15", lookback_days=5)[0]
+    assert r.insufficient_history is False
+    assert r.status in ("LOW", "OK")
+    assert r.observed_days == 5
+
+
+def test_future_sale_excluded_from_weekly_trend_regression():
+    # Exact Astra probe fixture (finding 4): a sale dated the day AFTER
+    # as_of, in the same ISO week, must not appear in that week's total.
+    from data_loader import SalesRow
+
+    future_sale = SalesRow(date="2026-01-16", sku="s", warehouse="w", units_sold=999)
+    trend = weekly_trend([future_sale], "2026-01-15")
+    assert trend[-1][1] == 0
+    assert 999 not in [v for _, v in trend]
 
 
 def test_sales_outlier_detection():
@@ -256,6 +346,69 @@ def test_run_daily_skips_when_lock_held(tmp_path):
     finally:
         holder.kill()
         holder.wait()
+
+
+def test_cli_exits_nonzero_and_no_ok_when_notifier_fails(tmp_path):
+    # Astra finding 1 regression, via the real CLI subprocess. A SKU that's
+    # LOW guarantees at least one fire() call happens; NOTIFY_CMD=false
+    # makes delivery fail, so the CLI must exit non-zero and never print
+    # "OK: report".
+    src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    inv_csv = tmp_path / "inventory.csv"
+    inv_csv.write_text(INV_HEADER + "SKU-1,Lamp,Home,wh-east,0,7\n")
+    sales_csv = tmp_path / "sales.csv"
+    from datetime import datetime, timedelta
+    lines = [SALES_HEADER.strip()]
+    for i in range(28):
+        d = (datetime.strptime(AS_OF, "%Y-%m-%d") - timedelta(days=i)).strftime("%Y-%m-%d")
+        lines.append(f"{d},SKU-1,wh-east,5")
+    sales_csv.write_text("\n".join(lines) + "\n")
+
+    env = dict(os.environ, NOTIFY_CMD="false", INV_STATE_DIR=str(tmp_path / "state"))
+    proc = subprocess.run(
+        [sys.executable, os.path.join(src_dir, "generate_report.py"),
+         "--inventory", str(inv_csv), "--sales", str(sales_csv),
+         "--output-dir", str(tmp_path / "output"), "--as-of", AS_OF],
+        cwd=src_dir, env=env, capture_output=True, text=True,
+    )
+    assert proc.returncode != 0
+    assert "OK: report" not in proc.stdout
+    assert "PARTIAL" in proc.stdout or "PARTIAL" in proc.stderr
+
+
+def test_run_daily_retries_delivery_after_notifier_failure(tmp_path):
+    src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    inv_csv = tmp_path / "inventory.csv"
+    inv_csv.write_text(INV_HEADER + "SKU-1,Lamp,Home,wh-east,0,7\n")
+    sales_csv = tmp_path / "sales.csv"
+    from datetime import datetime, timedelta
+    lines = [SALES_HEADER.strip()]
+    for i in range(28):
+        d = (datetime.strptime(AS_OF, "%Y-%m-%d") - timedelta(days=i)).strftime("%Y-%m-%d")
+        lines.append(f"{d},SKU-1,wh-east,5")
+    sales_csv.write_text("\n".join(lines) + "\n")
+
+    env = dict(
+        os.environ,
+        NOTIFY_CMD="false",
+        INV_INVENTORY=str(inv_csv),
+        INV_SALES=str(sales_csv),
+        INV_AS_OF=AS_OF,
+        INV_OUTPUT_DIR=str(tmp_path / "output"),
+        INV_ALERTS_LOG=str(tmp_path / "alerts.log"),
+        INV_LOCK_FILE=str(tmp_path / "run.lock"),
+        INV_RETRY_ATTEMPTS="2",
+        INV_RETRY_BACKOFF_SECONDS="0",
+        INV_STATE_DIR=str(tmp_path / "state"),
+    )
+    proc = subprocess.run(
+        ["bash", os.path.join(src_dir, "run_daily.sh")],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode != 0
+    log = (tmp_path / "alerts.log").read_text()
+    assert "attempt 1/2 failed" in log
+    assert "CRITICAL" in log
 
 
 def test_run_daily_retries_then_escalates(tmp_path):
