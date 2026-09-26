@@ -1,0 +1,13 @@
+[Unit]
+Description=Low-stock alert report generation
+Wants=inventory-report.timer
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/inventory-low-stock-alerts/src
+ExecStart=/opt/inventory-low-stock-alerts/src/run_daily.sh
+User=inventory-report
+ProtectSystem=strict
+ReadWritePaths=/opt/inventory-low-stock-alerts/output /opt/inventory-low-stock-alerts/state
+NoNewPrivileges=true
+PrivateTmp=true

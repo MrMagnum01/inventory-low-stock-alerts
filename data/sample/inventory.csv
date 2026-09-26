@@ -1,0 +1,22 @@
+sku,product_name,category,warehouse,on_hand,lead_time_days
+SKU-2001,Aurora Desk Lamp,Home,wh-east,102,7
+SKU-2001,Aurora Desk Lamp,Home,wh-west,121,5
+SKU-2002,Nimbus Backpack,Bags,wh-east,38,5
+SKU-2002,Nimbus Backpack,Bags,wh-west,113,5
+SKU-2003,Cobalt Water Bottle,Outdoor,wh-east,149,7
+SKU-2003,Cobalt Water Bottle,Outdoor,wh-west,29,5
+SKU-2004,Quartz Wireless Mouse,Electronics,wh-east,5,10
+SKU-2004,Quartz Wireless Mouse,Electronics,wh-west,37,7
+SKU-2005,Fernwood Notebook Set,Stationery,wh-east,43,14
+SKU-2005,Fernwood Notebook Set,Stationery,wh-west,35,5
+SKU-2006,Drift Bluetooth Speaker,Electronics,wh-east,77,5
+SKU-2006,Drift Bluetooth Speaker,Electronics,wh-west,167,14
+SKU-2007,Basalt Coffee Grinder,Kitchen,wh-east,32,7
+SKU-2007,Basalt Coffee Grinder,Kitchen,wh-west,31,7
+SKU-2008,Meridian Yoga Mat,Fitness,wh-east,94,14
+SKU-2008,Meridian Yoga Mat,Fitness,wh-west,56,5
+SKU-2002,,Bags,wh-west,40,7
+SKU-2003,Cobalt Water Bottle,Outdoor,wh-east,lots,7
+SKU-2007,Basalt Coffee Grinder,Kitchen,wh-west,30,0
+SKU-2005,Fernwood Notebook Set,Stationery,wh-east,60,7
+SKU-2005,Fernwood Notebook Set,Stationery,wh-east,60,7
